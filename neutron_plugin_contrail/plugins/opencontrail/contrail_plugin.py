@@ -78,24 +78,15 @@ class NeutronPluginContrailCoreV2(plugin_base.NeutronPluginContrailCoreBase):
 
     PLUGIN_URL_PREFIX = '/neutron'
 
+    def __init__(self, *args, **kwargs):
+        super(NeutronPluginContrailCoreV2, self).__init__(*args, **kwargs)
+        self._keystone_url = None
+        self._apiserverconnect = None
+
     def _build_auth_details(self):
         #keystone
         self._authn_token = None
         if cfg.CONF.auth_strategy == 'keystone':
-            kcfg = cfg.CONF.keystone_authtoken
-            body = '{"auth":{"passwordCredentials":{'
-            body += ' "username": "%s",' % (kcfg.admin_user)
-            body += ' "password": "%s"},' % (kcfg.admin_password)
-            body += ' "tenantName":"%s"}}' % (kcfg.admin_tenant_name)
-
-            self._authn_body = body
-            self._authn_token = cfg.CONF.keystone_authtoken.admin_token
-            self._keystone_url = "%s://%s:%s%s" % (
-                cfg.CONF.keystone_authtoken.auth_protocol,
-                cfg.CONF.keystone_authtoken.auth_host,
-                cfg.CONF.keystone_authtoken.auth_port,
-                "/v2.0/tokens")
-
             #Keystone SSL Support
             self._ksinsecure=cfg.CONF.keystone_authtoken.insecure
             kscertfile=cfg.CONF.keystone_authtoken.certfile
@@ -127,9 +118,82 @@ class NeutronPluginContrailCoreV2(plugin_base.NeutronPluginContrailCoreBase):
                self._apicertbundle=cfgmutils.getCertKeyCaBundle(_DEFAULT_API_CERT_BUNDLE,certs)
                self._use_api_certs=True
 
+    def _get_keystone_token_v2(self):
+        kcfg = cfg.CONF.keystone_authtoken
+        auth_body = {
+            "auth": {
+                "passwordCredentials": {
+                    "username": kcfg.admin_user,
+                    "password": kcfg.admin_password,
+                    "tenantName": kcfg.admin_tenant_name
+                }
+            }
+        }
+
+        keystone_url = "%s://%s:%s%s" % (
+            cfg.CONF.keystone_authtoken.auth_protocol,
+            cfg.CONF.keystone_authtoken.auth_host,
+            cfg.CONF.keystone_authtoken.auth_port,
+            "/v2.0/tokens"
+        )
+
+        response = self._query_keystone_server(keystone_url, auth_body)
+        if response.status_code == requests.codes.ok:
+            authn_content = json.loads(response.text)
+            self._authn_token = authn_content['access']['token']['id']
+            return response
+        else:
+            raise RuntimeError('Authentication Failure')
+
+    def _get_keystone_token_v3(self):
+        kcfg = cfg.CONF.keystone_authtoken
+        auth_body = {
+            'auth': {
+                'identity': {
+                    'methods': ['password'],
+                    'password': {
+                        'user': {
+                            'name': kcfg.username,
+                            'domain': { 'id': kcfg.user_domain_id },
+                            'password': kcfg.password
+                        }
+                    }
+                },
+                'scope': {
+                    'project': {
+                        'name': kcfg.project_name,
+                        'domain': { 'id': kcfg.project_domain_id }
+                    }
+                }
+            }
+        }
+
+        keystone_url = kcfg.auth_uri + '/v3/auth/tokens'
+
+        response = self._query_keystone_server(keystone_url, auth_body)
+        if response.status_code == requests.codes.created:
+            self._authn_token = response.headers['X-Subject-Token']
+            return response
+        else:
+            raise RuntimeError('Authentication Failure')
+
+    def _query_keystone_server(self, keystone_url, auth_body):
+        # Get token from keystone and save it for next request
+        verify = True
+        if self._ksinsecure:
+            verify = False
+        elif self._ksinsecure and self._use_ks_certs:
+            verify = self._kscertbundle
+
+        LOG.debug("QUERY %s with %s" % (keystone_url, auth_body))
+        return requests.post(keystone_url, data=json.dumps(auth_body), verify=verify,
+                             headers={'Content-type': 'application/json'})
 
     def _request_api_server(self, url, data=None, headers=None):
         # Attempt to post to Api-Server
+        if not self._keystone_url:
+            self._build_auth_details()
+
         if self._apiinsecure:
              response = requests.post(url, data=data, headers=headers,verify=False)
         elif not self._apiinsecure and self._use_api_certs:
@@ -137,28 +201,13 @@ class NeutronPluginContrailCoreV2(plugin_base.NeutronPluginContrailCoreBase):
         else:
              response = requests.post(url, data=data, headers=headers)
         if (response.status_code == requests.codes.unauthorized):
-            # Get token from keystone and save it for next request
-            if self._ksinsecure:
-               response = requests.post(self._keystone_url,
-                                        data=self._authn_body,
-                                        headers={'Content-type': 'application/json'},verify=False)
-            elif not self._ksinsecure and self._use_ks_certs:
-               response = requests.post(self._keystone_url,
-                                        data=self._authn_body,
-                                        headers={'Content-type': 'application/json'},verify=self._kscertbundle)
+            if cfg.CONF.keystone_authtoken.get('auth_version', 'v2.0') == 'v2.0':
+                response = self._get_keystone_token_v2()
             else:
-               response = requests.post(self._keystone_url,
-                                        data=self._authn_body,
-                                        headers={'Content-type': 'application/json'})
-            if (response.status_code == requests.codes.ok):
-                # plan is to re-issue original request with new token
-                auth_headers = headers or {}
-                authn_content = json.loads(response.text)
-                self._authn_token = authn_content['access']['token']['id']
-                auth_headers['X-AUTH-TOKEN'] = self._authn_token
-                response = self._request_api_server(url, data, auth_headers)
-            else:
-                raise RuntimeError('Authentication Failure')
+                response = self._get_keystone_token_v3()
+            auth_headers = headers or {}
+            auth_headers['X-AUTH-TOKEN'] = self._authn_token
+            response = self._request_api_server(url, data, auth_headers)
         return response
 
     def _request_api_server_authn(self, url, data=None, headers=None):
@@ -177,6 +226,9 @@ class NeutronPluginContrailCoreV2(plugin_base.NeutronPluginContrailCoreBase):
 
     def _relay_request(self, url_path, data=None):
         """Send received request to api server."""
+
+        if not self._apiserverconnect:
+            self._build_auth_details()
 
         url = "%s://%s:%s%s" % (self._apiserverconnect,
                                 cfg.CONF.APISERVER.api_server_ip,
