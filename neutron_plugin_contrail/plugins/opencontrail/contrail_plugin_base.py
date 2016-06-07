@@ -161,7 +161,6 @@ class NeutronPluginContrailCoreBase(neutron_plugin_base_v2.NeutronPluginBaseV2,
                 # Converting contrail backend error to Neutron Exception
                 raise InvalidContrailExtensionError(
                     ext_name=ext_name, ext_class=ext_class)
-        self._build_auth_details()
 
     def _build_auth_details(self):
         pass
